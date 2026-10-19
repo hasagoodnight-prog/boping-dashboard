@@ -1,16 +1,14 @@
 // Variables used by Scriptable.
 // icon-color: deep-gray; icon-glyph: tachometer-alt;
 
-// AI 額度小工具：同時顯示 Claude 與 Codex 的用量與重置時間。
-// 在 Scriptable app 裡執行，選「登入 Claude」「登入 ChatGPT」在 App 內登入一次即可（不用電腦）。
+// Claude 額度小工具：顯示 5 小時與每週的已用額度和重置時間。
+// 在 Scriptable app 裡執行，選「登入 Claude」在 App 內登入一次即可（不用電腦）。
 // 加到主畫面當「中」尺寸 widget 使用。
 // 點 widget 會打開 Scriptable 重新抓資料（等於「更新剩餘額度」）。
 
 const KC = {
   claudeSession: "aiusage.claude.sessionKey",
   claudePlan: "aiusage.claude.plan",
-  codexToken: "aiusage.codex.token",
-  codexAccount: "aiusage.codex.accountId",
 };
 
 const COLORS = {
@@ -23,7 +21,6 @@ const COLORS = {
   sub: new Color("#7D8796"),
   track: new Color("#2E3646"),
   claude: new Color("#F08A4B"),
-  codex: new Color("#3FD0B5"),
   buttonBg: new Color("#20393A"),
   buttonText: new Color("#3FD0B5"),
   error: new Color("#FF7A7A"),
@@ -57,13 +54,6 @@ function formatReset(seconds) {
   if (d > 0) return `${d}天${h}小時`;
   if (h > 0) return `${h}小時${m}分鐘`;
   return `${m}分鐘${s}秒`;
-}
-
-function windowLabel(seconds) {
-  if (!seconds) return "用量";
-  if (seconds >= 6 * 86400) return "每週";
-  if (seconds >= 86400) return `${Math.round(seconds / 86400)} 天`;
-  return `${Math.round(seconds / 3600)} 小時`;
 }
 
 function secondsUntil(isoOrEpoch) {
@@ -195,70 +185,6 @@ async function fetchClaude() {
   };
 }
 
-// ---------- Codex (ChatGPT) ----------
-
-function codexPlanName(raw) {
-  if (!raw) return "";
-  const map = {
-    free: "Free",
-    plus: "Plus",
-    pro: "Pro",
-    prolite: "Pro Lite",
-    pro_lite: "Pro Lite",
-    team: "Team",
-    business: "Business",
-    enterprise: "Enterprise",
-    edu: "Edu",
-  };
-  return map[String(raw).toLowerCase()] || String(raw);
-}
-
-async function codexViaToken(token) {
-  token = token.replace(/^Bearer\s+/i, "");
-  const headers = { Authorization: `Bearer ${token}` };
-  const account = kcGet(KC.codexAccount);
-  if (account) headers["ChatGPT-Account-Id"] = account;
-  return getJSON("https://chatgpt.com/backend-api/wham/usage", headers);
-}
-
-function codexViaWeb() {
-  const account = kcGet(KC.codexAccount);
-  return webRun(
-    "https://chatgpt.com",
-    `
-    const s = await fetch("/api/auth/session", { credentials: "include" });
-    const session = s.ok ? await s.json() : {};
-    if (!session.accessToken) return done({ error: "尚未設定" });
-    const headers = { Authorization: "Bearer " + session.accessToken };
-    const account = ${JSON.stringify(account)};
-    if (account) headers["ChatGPT-Account-Id"] = account;
-    const r = await fetch("/backend-api/wham/usage", { headers, credentials: "include" });
-    if (r.status === 401 || r.status === 403) return done({ error: "尚未設定" });
-    if (!r.ok) return done({ error: "HTTP " + r.status });
-    done(await r.json());
-  `
-  );
-}
-
-async function fetchCodex() {
-  const token = kcGet(KC.codexToken);
-  const data = token ? await codexViaToken(token) : await codexViaWeb();
-  const rl = data.rate_limit || {};
-  const rows = [];
-  for (const w of [rl.primary_window, rl.secondary_window]) {
-    if (!w) continue;
-    const resetIn =
-      w.reset_after_seconds != null ? w.reset_after_seconds : secondsUntil(w.reset_at);
-    rows.push({
-      label: windowLabel(w.limit_window_seconds),
-      pct: clampPct(w.used_percent),
-      resetIn,
-    });
-  }
-  if (rows.length === 0) throw new Error("沒有用量資料");
-  return { plan: codexPlanName(data.plan_type), rows };
-}
-
 // ---------- 快取 ----------
 
 function loadCache() {
@@ -367,51 +293,48 @@ function addRow(stack, r, color, barWidth) {
   s.textColor = COLORS.sub;
 }
 
-function addColumn(parent, name, symbol, color, data, barWidth) {
+function addColumn(parent, r, width) {
   const col = parent.addStack();
   col.layoutVertically();
-  col.size = new Size(barWidth, 0);
-  addHeader(col, name, symbol, color, data.plan);
-  col.addSpacer(8);
-
-  if (data.error) {
-    const e = col.addText(data.error === "尚未設定" ? "尚未登入，請打開 Scriptable 執行此腳本登入" : data.error);
-    e.font = Font.systemFont(11);
-    e.textColor = COLORS.error;
-    e.minimumScaleFactor = 0.7;
-    col.addSpacer();
-    return;
-  }
-
-  data.rows.forEach((r, i) => {
-    if (i > 0) col.addSpacer(8);
-    addRow(col, r, color, barWidth);
-  });
-  if (data.stale) {
-    col.addSpacer(4);
-    const st = col.addText(`⚠︎ 舊資料（${data.stale}）`);
-    st.font = Font.systemFont(9);
-    st.textColor = COLORS.sub;
-  }
-  col.addSpacer();
+  col.size = new Size(width, 0);
+  addRow(col, r, COLORS.claude, width);
 }
 
-function buildWidget(claude, codex) {
+function buildWidget(claude) {
   const w = new ListWidget();
   w.backgroundColor = COLORS.bg;
-  w.setPadding(12, 14, 12, 14);
+  w.setPadding(14, 16, 12, 16);
   w.url = `scriptable:///run?scriptName=${encodeURIComponent(Script.name())}&refresh=1`;
 
-  const barWidth = 138;
-  const cols = w.addStack();
-  cols.topAlignContent();
-  addColumn(cols, "Claude", "asterisk", COLORS.claude, claude, barWidth);
-  cols.addSpacer(10);
-  const div = cols.addStack();
-  div.backgroundColor = COLORS.divider;
-  div.size = new Size(1, 96);
-  cols.addSpacer(10);
-  addColumn(cols, "Codex", "circle.hexagongrid", COLORS.title, codex, barWidth);
+  addHeader(w, "Claude", "asterisk", COLORS.claude, claude.plan);
+  w.addSpacer(10);
+
+  if (claude.error) {
+    const e = w.addText(claude.error === "尚未設定" ? "尚未登入，請打開 Scriptable 執行此腳本登入" : claude.error);
+    e.font = Font.systemFont(12);
+    e.textColor = COLORS.error;
+    e.minimumScaleFactor = 0.7;
+  } else {
+    const colWidth = 136;
+    const cols = w.addStack();
+    cols.topAlignContent();
+    claude.rows.forEach((r, i) => {
+      if (i > 0) {
+        cols.addSpacer(10);
+        const div = cols.addStack();
+        div.backgroundColor = COLORS.divider;
+        div.size = new Size(1, 44);
+        cols.addSpacer(10);
+      }
+      addColumn(cols, r, colWidth);
+    });
+    if (claude.stale) {
+      w.addSpacer(4);
+      const st = w.addText(`⚠︎ 舊資料（${claude.stale}）`);
+      st.font = Font.systemFont(9);
+      st.textColor = COLORS.sub;
+    }
+  }
 
   w.addSpacer();
 
@@ -453,11 +376,10 @@ async function askText(title, message, current, placeholder) {
 
 async function settings() {
   const a = new Alert();
-  a.title = "AI 額度小工具";
-  a.message = "第一次使用請先登入 Claude 和 ChatGPT（建議用 email 驗證碼登入，Google 登入可能被擋）。登入完按左上角「完成」。";
+  a.title = "Claude 額度小工具";
+  a.message = "第一次使用請先登入 Claude（建議用 email 驗證碼登入，Google 登入可能被擋）。登入完按左上角「完成」。";
   a.addAction("預覽小工具");
   a.addAction("登入 Claude");
-  a.addAction("登入 ChatGPT（Codex）");
   a.addAction("進階：手動貼金鑰");
   a.addDestructiveAction("清除全部設定");
   a.addCancelAction("取消");
@@ -466,10 +388,8 @@ async function settings() {
   if (choice === 1) {
     await webLogin("https://claude.ai/login");
   } else if (choice === 2) {
-    await webLogin("https://chatgpt.com/auth/login");
-  } else if (choice === 3) {
     return await advanced();
-  } else if (choice === 4) {
+  } else if (choice === 3) {
     Object.values(KC).forEach((k) => kcSet(k, ""));
     saveCache({});
   } else if (choice === -1) {
@@ -483,8 +403,6 @@ async function advanced() {
   a.title = "進階設定";
   a.message = "有填金鑰就優先用金鑰，沒填就用 App 內登入。";
   a.addAction(`Claude sessionKey${kcGet(KC.claudeSession) ? " ✓" : ""}`);
-  a.addAction(`Codex token${kcGet(KC.codexToken) ? " ✓" : ""}`);
-  a.addAction("Codex 帳號 ID（多個工作區才需要）");
   a.addAction("自訂 Claude 方案名稱");
   a.addCancelAction("取消");
   const choice = await a.presentSheet();
@@ -493,12 +411,6 @@ async function advanced() {
     const v = await askText("Claude sessionKey", "claude.ai 的 sessionKey cookie（sk-ant-sid01-…），留空改回 App 內登入", kcGet(KC.claudeSession), "sk-ant-sid01-...");
     if (v != null) kcSet(KC.claudeSession, v);
   } else if (choice === 1) {
-    const v = await askText("Codex token", "chatgpt.com/api/auth/session 的 accessToken，或 ~/.codex/auth.json 的 access_token，留空改回 App 內登入", kcGet(KC.codexToken), "eyJ...");
-    if (v != null) kcSet(KC.codexToken, v);
-  } else if (choice === 2) {
-    const v = await askText("Codex 帳號 ID", "~/.codex/auth.json 裡的 account_id", kcGet(KC.codexAccount), "account_id");
-    if (v != null) kcSet(KC.codexAccount, v);
-  } else if (choice === 3) {
     const v = await askText("Claude 方案名稱", "留空就自動判斷（例如 Team、Max、Pro）", kcGet(KC.claudePlan), "Team");
     if (v != null) kcSet(KC.claudePlan, v);
   } else {
@@ -511,12 +423,9 @@ async function advanced() {
 
 async function render() {
   const cache = loadCache();
-  const [claude, codex] = await Promise.all([
-    load("claude", fetchClaude, cache),
-    load("codex", fetchCodex, cache),
-  ]);
+  const claude = await load("claude", fetchClaude, cache);
   saveCache(cache);
-  return buildWidget(claude, codex);
+  return buildWidget(claude);
 }
 
 const fromWidgetTap = args.queryParameters && args.queryParameters.refresh === "1";
