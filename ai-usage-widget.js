@@ -157,14 +157,38 @@ function claudeViaWeb() {
     const org = orgs.find((o) => (o.capabilities || []).includes("chat")) || orgs[0];
     const u = await fetch("/api/organizations/" + org.uuid + "/usage", { credentials: "include" });
     if (!u.ok) return done({ error: "HTTP " + u.status });
-    done({ org: { uuid: org.uuid, capabilities: org.capabilities, raven_type: org.raven_type }, usage: await u.json() });
+    const m = document.cookie.match(/(?:^|; )sessionKey=([^;]+)/);
+    done({
+      org: { uuid: org.uuid, capabilities: org.capabilities, raven_type: org.raven_type },
+      usage: await u.json(),
+      sessionKey: m ? decodeURIComponent(m[1]) : null,
+    });
   `
   );
 }
 
 async function fetchClaude() {
+  // 小工具和 App 是分開執行的，App 內的登入狀態小工具不一定讀得到。
+  // 所以 App 內登入成功時順便把 sessionKey 存進鑰匙圈，小工具就能用。
   const session = kcGet(KC.claudeSession);
-  const { org, usage } = session ? await claudeViaKey(session) : await claudeViaWeb();
+  let res = null;
+  let keyError = null;
+  if (session) {
+    try {
+      res = await claudeViaKey(session);
+    } catch (e) {
+      keyError = e;
+    }
+  }
+  if (!res) {
+    try {
+      res = await claudeViaWeb();
+    } catch (e) {
+      throw keyError && e.message === "尚未設定" ? keyError : e;
+    }
+    if (res.sessionKey && res.sessionKey !== session) kcSet(KC.claudeSession, res.sessionKey);
+  }
+  const { org, usage } = res;
 
   const rows = [];
   const add = (label, w) => {
@@ -209,13 +233,15 @@ async function load(name, fetcher, cache) {
     return data;
   } catch (e) {
     const old = cache[name];
-    if (old && e.message !== "尚未設定") {
+    // App 內沒登入就提示登入；小工具抓不到時先顯示上次在 App 裡抓到的資料
+    if (old && (config.runsInWidget || e.message !== "尚未設定")) {
       const elapsed = (Date.now() - old.at) / 1000;
       const data = JSON.parse(JSON.stringify(old.data));
       data.rows.forEach((r) => {
         if (r.resetIn != null) r.resetIn -= elapsed;
       });
       data.stale = e.message;
+      data.staleMinutes = Math.max(0, Math.round(elapsed / 60));
       return data;
     }
     return { error: e.message };
@@ -330,7 +356,9 @@ function buildWidget(claude) {
     });
     if (claude.stale) {
       w.addSpacer(4);
-      const st = w.addText(`⚠︎ 舊資料（${claude.stale}）`);
+      const m = claude.staleMinutes;
+      const ago = m < 60 ? `${m} 分鐘` : m < 1440 ? `${Math.round(m / 60)} 小時` : `${Math.round(m / 1440)} 天`;
+      const st = w.addText(`上次更新 ${ago}前 · 點一下更新`);
       st.font = Font.systemFont(9);
       st.textColor = COLORS.sub;
     }
