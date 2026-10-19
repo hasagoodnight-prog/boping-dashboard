@@ -122,6 +122,7 @@ async function webRun(origin, body) {
   const js = `
     const done = (v) => completion(JSON.stringify(v));
     (async () => { ${body} })().catch((e) => done({ error: String(e && e.message || e) }));
+    0; // 最後一行要回傳簡單的值，回傳 Promise 會讓 Scriptable 報錯
   `;
   const raw = await wv.evaluateJavaScript(js, true);
   const out = JSON.parse(raw);
