@@ -2,7 +2,8 @@
 // icon-color: deep-gray; icon-glyph: tachometer-alt;
 
 // AI 額度小工具：同時顯示 Claude 與 Codex 的用量與重置時間。
-// 在 Scriptable app 裡直接執行可設定金鑰、預覽；加到主畫面當「中」尺寸 widget 使用。
+// 在 Scriptable app 裡執行，選「登入 Claude」「登入 ChatGPT」在 App 內登入一次即可（不用電腦）。
+// 加到主畫面當「中」尺寸 widget 使用。
 // 點 widget 會打開 Scriptable 重新抓資料（等於「更新剩餘額度」）。
 
 const KC = {
@@ -104,6 +105,30 @@ async function getJSON(url, headers) {
   return body;
 }
 
+// ---------- App 內登入（WebView） ----------
+// Scriptable 的 WebView 會記住登入狀態，之後在該網站裡用 fetch 讀資料，
+// cookie 由瀏覽器自己帶，所以不用手動複製 sessionKey。
+
+async function webLogin(url) {
+  const wv = new WebView();
+  await wv.loadURL(url);
+  await wv.present(true); // 使用者登入完按「完成」關掉
+}
+
+// 在指定網站裡執行一段 async 程式，回傳 JSON。程式裡用 done(值) 回傳。
+async function webRun(origin, body) {
+  const wv = new WebView();
+  await wv.loadURL(origin + "/robots.txt");
+  const js = `
+    const done = (v) => completion(JSON.stringify(v));
+    (async () => { ${body} })().catch((e) => done({ error: String(e && e.message || e) }));
+  `;
+  const raw = await wv.evaluateJavaScript(js, true);
+  const out = JSON.parse(raw);
+  if (out && out.error) throw new Error(out.error);
+  return out;
+}
+
 // ---------- Claude ----------
 
 function claudePlanName(org) {
@@ -117,19 +142,38 @@ function claudePlanName(org) {
   return "Free";
 }
 
-async function fetchClaude() {
-  const session = kcGet(KC.claudeSession);
-  if (!session) throw new Error("尚未設定");
+async function claudeViaKey(session) {
   const headers = { Cookie: `sessionKey=${session}` };
-
   const orgs = await getJSON("https://claude.ai/api/organizations", headers);
   if (!Array.isArray(orgs) || orgs.length === 0) throw new Error("找不到組織");
   const org = orgs.find((o) => (o.capabilities || []).includes("chat")) || orgs[0];
-
   const usage = await getJSON(
     `https://claude.ai/api/organizations/${org.uuid}/usage`,
     headers
   );
+  return { org, usage };
+}
+
+function claudeViaWeb() {
+  return webRun(
+    "https://claude.ai",
+    `
+    const r = await fetch("/api/organizations", { credentials: "include" });
+    if (r.status === 401 || r.status === 403) return done({ error: "尚未設定" });
+    if (!r.ok) return done({ error: "HTTP " + r.status });
+    const orgs = await r.json();
+    if (!Array.isArray(orgs) || !orgs.length) return done({ error: "找不到組織" });
+    const org = orgs.find((o) => (o.capabilities || []).includes("chat")) || orgs[0];
+    const u = await fetch("/api/organizations/" + org.uuid + "/usage", { credentials: "include" });
+    if (!u.ok) return done({ error: "HTTP " + u.status });
+    done({ org: { uuid: org.uuid, capabilities: org.capabilities, raven_type: org.raven_type }, usage: await u.json() });
+  `
+  );
+}
+
+async function fetchClaude() {
+  const session = kcGet(KC.claudeSession);
+  const { org, usage } = session ? await claudeViaKey(session) : await claudeViaWeb();
 
   const rows = [];
   const add = (label, w) => {
@@ -168,15 +212,36 @@ function codexPlanName(raw) {
   return map[String(raw).toLowerCase()] || String(raw);
 }
 
-async function fetchCodex() {
-  let token = kcGet(KC.codexToken);
-  if (!token) throw new Error("尚未設定");
+async function codexViaToken(token) {
   token = token.replace(/^Bearer\s+/i, "");
   const headers = { Authorization: `Bearer ${token}` };
   const account = kcGet(KC.codexAccount);
   if (account) headers["ChatGPT-Account-Id"] = account;
+  return getJSON("https://chatgpt.com/backend-api/wham/usage", headers);
+}
 
-  const data = await getJSON("https://chatgpt.com/backend-api/wham/usage", headers);
+function codexViaWeb() {
+  const account = kcGet(KC.codexAccount);
+  return webRun(
+    "https://chatgpt.com",
+    `
+    const s = await fetch("/api/auth/session", { credentials: "include" });
+    const session = s.ok ? await s.json() : {};
+    if (!session.accessToken) return done({ error: "尚未設定" });
+    const headers = { Authorization: "Bearer " + session.accessToken };
+    const account = ${JSON.stringify(account)};
+    if (account) headers["ChatGPT-Account-Id"] = account;
+    const r = await fetch("/backend-api/wham/usage", { headers, credentials: "include" });
+    if (r.status === 401 || r.status === 403) return done({ error: "尚未設定" });
+    if (!r.ok) return done({ error: "HTTP " + r.status });
+    done(await r.json());
+  `
+  );
+}
+
+async function fetchCodex() {
+  const token = kcGet(KC.codexToken);
+  const data = token ? await codexViaToken(token) : await codexViaWeb();
   const rl = data.rate_limit || {};
   const rows = [];
   for (const w of [rl.primary_window, rl.secondary_window]) {
@@ -309,7 +374,7 @@ function addColumn(parent, name, symbol, color, data, barWidth) {
   col.addSpacer(8);
 
   if (data.error) {
-    const e = col.addText(data.error === "尚未設定" ? "尚未設定，請在 App 內執行" : data.error);
+    const e = col.addText(data.error === "尚未設定" ? "尚未登入，請打開 Scriptable 執行此腳本登入" : data.error);
     e.font = Font.systemFont(11);
     e.textColor = COLORS.error;
     e.minimumScaleFactor = 0.7;
@@ -388,47 +453,54 @@ async function askText(title, message, current, placeholder) {
 async function settings() {
   const a = new Alert();
   a.title = "AI 額度小工具";
-  a.message = "要做什麼？";
+  a.message = "第一次使用請先登入 Claude 和 ChatGPT（建議用 email 驗證碼登入，Google 登入可能被擋）。登入完按左上角「完成」。";
   a.addAction("預覽小工具");
-  a.addAction(`設定 Claude sessionKey${kcGet(KC.claudeSession) ? " ✓" : ""}`);
-  a.addAction(`設定 Codex token${kcGet(KC.codexToken) ? " ✓" : ""}`);
-  a.addAction("設定 Codex 帳號 ID（選填）");
-  a.addAction("自訂 Claude 方案名稱（選填）");
+  a.addAction("登入 Claude");
+  a.addAction("登入 ChatGPT（Codex）");
+  a.addAction("進階：手動貼金鑰");
   a.addDestructiveAction("清除全部設定");
   a.addCancelAction("取消");
   const choice = await a.presentSheet();
 
   if (choice === 1) {
-    const v = await askText(
-      "Claude sessionKey",
-      "在電腦瀏覽器登入 claude.ai → 開發者工具 → Cookies → 複製 sessionKey（sk-ant-sid01-…）",
-      kcGet(KC.claudeSession),
-      "sk-ant-sid01-..."
-    );
-    if (v != null) kcSet(KC.claudeSession, v);
+    await webLogin("https://claude.ai/login");
   } else if (choice === 2) {
-    const v = await askText(
-      "Codex token",
-      "登入 chatgpt.com 後打開 chatgpt.com/api/auth/session，複製 accessToken；或用電腦 ~/.codex/auth.json 裡的 access_token",
-      kcGet(KC.codexToken),
-      "eyJ..."
-    );
-    if (v != null) kcSet(KC.codexToken, v);
+    await webLogin("https://chatgpt.com/auth/login");
   } else if (choice === 3) {
-    const v = await askText(
-      "Codex 帳號 ID",
-      "有多個工作區時才需要，~/.codex/auth.json 裡的 account_id",
-      kcGet(KC.codexAccount),
-      "account_id"
-    );
-    if (v != null) kcSet(KC.codexAccount, v);
+    return await advanced();
   } else if (choice === 4) {
-    const v = await askText("Claude 方案名稱", "留空就自動判斷（例如 Team、Max、Pro）", kcGet(KC.claudePlan), "Team");
-    if (v != null) kcSet(KC.claudePlan, v);
-  } else if (choice === 5) {
     Object.values(KC).forEach((k) => kcSet(k, ""));
     saveCache({});
   } else if (choice === -1) {
+    return false;
+  }
+  return true;
+}
+
+async function advanced() {
+  const a = new Alert();
+  a.title = "進階設定";
+  a.message = "有填金鑰就優先用金鑰，沒填就用 App 內登入。";
+  a.addAction(`Claude sessionKey${kcGet(KC.claudeSession) ? " ✓" : ""}`);
+  a.addAction(`Codex token${kcGet(KC.codexToken) ? " ✓" : ""}`);
+  a.addAction("Codex 帳號 ID（多個工作區才需要）");
+  a.addAction("自訂 Claude 方案名稱");
+  a.addCancelAction("取消");
+  const choice = await a.presentSheet();
+
+  if (choice === 0) {
+    const v = await askText("Claude sessionKey", "claude.ai 的 sessionKey cookie（sk-ant-sid01-…），留空改回 App 內登入", kcGet(KC.claudeSession), "sk-ant-sid01-...");
+    if (v != null) kcSet(KC.claudeSession, v);
+  } else if (choice === 1) {
+    const v = await askText("Codex token", "chatgpt.com/api/auth/session 的 accessToken，或 ~/.codex/auth.json 的 access_token，留空改回 App 內登入", kcGet(KC.codexToken), "eyJ...");
+    if (v != null) kcSet(KC.codexToken, v);
+  } else if (choice === 2) {
+    const v = await askText("Codex 帳號 ID", "~/.codex/auth.json 裡的 account_id", kcGet(KC.codexAccount), "account_id");
+    if (v != null) kcSet(KC.codexAccount, v);
+  } else if (choice === 3) {
+    const v = await askText("Claude 方案名稱", "留空就自動判斷（例如 Team、Max、Pro）", kcGet(KC.claudePlan), "Team");
+    if (v != null) kcSet(KC.claudePlan, v);
+  } else {
     return false;
   }
   return true;
