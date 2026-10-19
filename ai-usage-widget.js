@@ -238,7 +238,14 @@ async function load(name, fetcher, cache) {
       const elapsed = (Date.now() - old.at) / 1000;
       const data = JSON.parse(JSON.stringify(old.data));
       data.rows.forEach((r) => {
-        if (r.resetIn != null) r.resetIn -= elapsed;
+        if (r.resetIn == null) return;
+        r.resetIn -= elapsed;
+        // 舊資料的倒數已經過了，代表這段額度已經重置
+        if (r.resetIn <= 0) {
+          r.pct = 0;
+          r.resetIn = null;
+          r.wasReset = true;
+        }
       });
       data.stale = e.message;
       data.staleMinutes = Math.max(0, Math.round(elapsed / 60));
@@ -314,7 +321,7 @@ function addRow(stack, r, color, barWidth) {
   bar.imageSize = new Size(barWidth, 4);
   stack.addSpacer(3);
 
-  const s = stack.addText(`重置 ${formatReset(r.resetIn)}`);
+  const s = stack.addText(r.wasReset ? "已重置" : `重置 ${formatReset(r.resetIn)}`);
   s.font = Font.systemFont(10);
   s.textColor = COLORS.sub;
 }
