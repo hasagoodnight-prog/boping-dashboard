@@ -42,6 +42,13 @@ function kcSet(key, value) {
   else if (Keychain.contains(key)) Keychain.remove(key);
 }
 
+// 只留下 sk-ant-… 那一段。複製時常夾帶換行、空白或「sessionKey=」，
+// 直接放進 Cookie 標頭會讓 Scriptable 閃退。
+function cleanSessionKey(v) {
+  const m = String(v || "").match(/sk-ant-[A-Za-z0-9_-]+/);
+  return m ? m[0] : "";
+}
+
 function formatReset(seconds) {
   if (seconds == null || isNaN(seconds)) return "—";
   let s = Math.max(0, Math.floor(seconds));
@@ -170,7 +177,7 @@ function claudeViaWeb() {
 async function fetchClaude() {
   // 小工具和 App 是分開執行的，App 內的登入狀態小工具不一定讀得到。
   // 所以 App 內登入成功時順便把 sessionKey 存進鑰匙圈，小工具就能用。
-  const session = kcGet(KC.claudeSession);
+  const session = cleanSessionKey(kcGet(KC.claudeSession));
   let res = null;
   let keyError = null;
   if (session) {
@@ -444,7 +451,18 @@ async function advanced() {
 
   if (choice === 0) {
     const v = await askText("Claude sessionKey", "claude.ai 的 sessionKey cookie（sk-ant-sid01-…），留空改回 App 內登入", kcGet(KC.claudeSession), "sk-ant-sid01-...");
-    if (v != null) kcSet(KC.claudeSession, v);
+    if (v != null) {
+      const key = cleanSessionKey(v);
+      if (v && !key) {
+        const bad = new Alert();
+        bad.title = "格式不對";
+        bad.message = "sessionKey 應該是 sk-ant-sid01- 開頭的一長串，請重新複製。";
+        bad.addAction("好");
+        await bad.presentAlert();
+        return false;
+      }
+      kcSet(KC.claudeSession, key);
+    }
   } else if (choice === 1) {
     const v = await askText("Claude 方案名稱", "留空就自動判斷（例如 Team、Max、Pro）", kcGet(KC.claudePlan), "Team");
     if (v != null) kcSet(KC.claudePlan, v);
